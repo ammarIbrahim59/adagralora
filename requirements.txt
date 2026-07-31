@@ -1,0 +1,11 @@
+peft==0.20.0
+transformers
+datasets
+accelerate
+trl
+torch
+scikit-learn
+matplotlib
+pandas
+pyyaml
+pytest
