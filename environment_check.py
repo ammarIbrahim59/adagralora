@@ -25,6 +25,7 @@ MIN_VERSIONS = {
     "datasets": (2, 14),
 }
 PINNED_PEFT = "0.20.0"
+MIN_PYTHON = (3, 10)
 
 GREEN, RED, YELLOW, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -54,6 +55,16 @@ def _version_tuple(v: str) -> tuple[int, ...]:
 def check_packages() -> bool:
     print("Packages")
     healthy = True
+
+    # Checked before anything is imported: below this floor pip cannot resolve
+    # peft==0.20.0 at all, and the resolver error it prints blames the pin rather
+    # than the interpreter that caused it.
+    floor = ".".join(map(str, MIN_PYTHON))
+    if sys.version_info[:2] < MIN_PYTHON:
+        fail(f"python {sys.version.split()[0]} is below {floor}, which peft=={PINNED_PEFT} requires")
+        healthy = False
+    else:
+        ok(f"python {sys.version.split()[0]} (>= {floor})")
 
     try:
         import peft

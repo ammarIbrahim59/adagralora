@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
+from peft.tuners.gralora import GraloraLayer
 
 from adagralora.patching import (
     DEFAULT_TARGET_MODULES,
     KNOWN_MODELS,
     KConstraintError,
+    _dims_for_model,
     _representative_k,
     build_mixed_gralora,
     canonical_name,
@@ -56,6 +60,11 @@ def test_validate_k_rejects_non_positive_k():
         validate_k(r=16, in_features=96, out_features=24, k=0)
 
 
+def test_validate_k_rejects_a_non_positive_r():
+    with pytest.raises(KConstraintError, match="r must be a positive integer"):
+        validate_k(r=0, in_features=96, out_features=24, k=2)
+
+
 def test_validate_k_includes_the_layer_name_in_the_error():
     with pytest.raises(KConstraintError, match="layers.0.self_attn.k_proj"):
         validate_k(r=16, in_features=96, out_features=24, k=16, where="layers.0.self_attn.k_proj")
@@ -75,6 +84,11 @@ def test_legal_k_values_filters_to_the_legal_subset():
 
 def test_legal_k_values_can_return_empty():
     assert legal_k_values(r=3, in_features=96, out_features=24, candidates=(2, 4, 8)) == []
+
+
+def test_legal_k_values_is_empty_for_an_impossible_rank():
+    """0 % k == 0 for every k, so an unguarded r reports an impossible rank as fine."""
+    assert legal_k_values(r=0, in_features=96, out_features=96) == []
 
 
 def test_legal_k_values_dedupes_and_sorts():
@@ -120,6 +134,20 @@ def test_validate_k_map_rejects_an_unknown_layer_name(tiny_model):
         validate_k_map(dims, r=16, k_map={"layers.9.mlp.down_proj": 4})
 
 
+def test_validate_k_map_rejects_a_non_integral_k(tiny_model):
+    """An allocator ranking is continuous; int() would truncate 2.9 to a plausible 2."""
+    dims = module_dims(tiny_model())
+    with pytest.raises(KConstraintError, match="must be an integer"):
+        validate_k_map(dims, r=16, k_map={"layers.0.self_attn.q_proj": 2.9}, default_k=2)
+
+
+def test_validate_k_map_rejects_a_bool_k(tiny_model):
+    """bool is an int, so only an explicit check keeps True from becoming k=1."""
+    dims = module_dims(tiny_model())
+    with pytest.raises(KConstraintError, match="must be an integer"):
+        validate_k_map(dims, r=16, k_map={"layers.0.self_attn.q_proj": True}, default_k=2)
+
+
 def test_validate_k_map_rejects_an_illegal_entry(tiny_model):
     dims = module_dims(tiny_model())
     with pytest.raises(KConstraintError, match="k_proj"):
@@ -161,6 +189,17 @@ def test_build_rejects_an_illegal_k_before_allocating(tiny_model, monkeypatch):
         build_mixed_gralora(tiny_model(), r=16, k_map={"layers.0.self_attn.k_proj": 16})
 
 
+def test_build_rejects_a_non_positive_rank_before_allocating(tiny_model, monkeypatch):
+    """peft would catch r=0 too, but only part-way through wrapping the model."""
+
+    def explode(*args, **kwargs):
+        raise AssertionError("get_peft_model was called despite an impossible rank")
+
+    monkeypatch.setattr("adagralora.patching.get_peft_model", explode)
+    with pytest.raises(KConstraintError, match="r must be a positive integer"):
+        build_mixed_gralora(tiny_model(), r=0, default_k=2)
+
+
 def test_build_rejects_a_target_list_that_matches_nothing(tiny_model):
     with pytest.raises(ValueError, match="No nn.Linear modules matched"):
         build_mixed_gralora(tiny_model(), r=16, target_modules=("nonexistent_proj",))
@@ -186,6 +225,63 @@ def test_adapter_changes_the_output_once_b_is_non_zero(tiny_model, sample_input)
                 param.add_(0.05)
         after = peft_model(sample_input)
     assert not torch.allclose(before, after, atol=1e-6)
+
+
+@pytest.mark.parametrize("default_k", [1, 2, 4, 8])
+def test_requested_k_reaches_the_tensor_shapes(tiny_model, default_k):
+    """The recorded k is only a scalar; this pins that the blocks are really built at it.
+
+    A regression that records k but chunks at a different granularity would
+    survive every count-based test and the save/load round trip alike, since
+    both sides would be wrong identically.
+    """
+    peft_model = build_mixed_gralora(
+        tiny_model(), r=16, k_map={"layers.0.self_attn.q_proj": 8}, default_k=default_k
+    )
+    installed = current_k_map(peft_model)
+    checked = 0
+    for name, module in peft_model.named_modules():
+        if not isinstance(module, GraloraLayer):
+            continue
+        k = installed[canonical_name(name)]
+        assert tuple(module.gralora_A["default"].shape) == (k, module.in_features // k, 16)
+        assert tuple(module.gralora_B["default"].shape) == (k, 16, module.out_features // k)
+        checked += 1
+    assert checked == 14
+    assert installed["layers.0.self_attn.q_proj"] == 8
+
+
+def test_gradients_reach_every_rebuilt_adapter_parameter(tiny_model, sample_input):
+    """update_layer reassigns into a ParameterDict; the results must stay leaves."""
+    peft_model = build_mixed_gralora(tiny_model(), r=16, k_map={"layers.0.mlp.down_proj": 4}, default_k=2)
+    trainable = [(n, p) for n, p in peft_model.named_parameters() if p.requires_grad]
+    assert all(p.is_leaf for _, p in trainable), "a rebuilt adapter tensor is not a leaf"
+
+    peft_model(sample_input).sum().backward()
+    ungraded = [n for n, p in trainable if p.grad is None]
+    assert not ungraded, f"no gradient reached: {ungraded[:5]}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_adapters_stay_fp32_over_a_half_precision_base(tiny_model, sample_input, dtype):
+    """The fp16 path the README warns about for NaN loss.
+
+    Rebuilding a layer moves its fresh tensors to the base layer's dtype, which
+    undoes the one upcast get_peft_model does at injection time. Nothing else in
+    the suite leaves fp32, so the divergence is silent everywhere else.
+    """
+    peft_model = build_mixed_gralora(tiny_model().to(dtype), r=16, default_k=4)
+    assert {p.dtype for n, p in peft_model.named_parameters() if "gralora" in n} == {torch.float32}
+    with torch.no_grad():
+        assert peft_model(sample_input.to(dtype)).dtype is dtype
+
+
+def test_the_fp32_upcast_can_be_opted_out_of(tiny_model):
+    """Same contract as get_peft_model's keyword of the same name."""
+    peft_model = build_mixed_gralora(
+        tiny_model().to(torch.bfloat16), r=16, default_k=4, autocast_adapter_dtype=False
+    )
+    assert {p.dtype for n, p in peft_model.named_parameters() if "gralora" in n} == {torch.bfloat16}
 
 
 def test_only_adapter_parameters_are_trainable(tiny_model):
@@ -253,3 +349,124 @@ def test_known_models_have_a_legal_k_at_every_planned_rank(model_name, r):
 def test_known_models_cover_every_default_target_module():
     for model_name, dims in KNOWN_MODELS.items():
         assert set(dims) == set(DEFAULT_TARGET_MODULES), model_name
+
+
+# --- sweep CLI -------------------------------------------------------------
+
+
+@pytest.fixture
+def offline(monkeypatch):
+    """Force the KNOWN_MODELS path, so the CLI tests never touch the network."""
+    import transformers
+
+    def unavailable(*args, **kwargs):
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", unavailable)
+
+
+@pytest.fixture
+def local_config(monkeypatch):
+    """Serve a config built in-process, so the *preferred* live path runs offline.
+
+    Same fields as the real Qwen2.5 configs; nothing is fetched.
+    """
+    import transformers
+    from transformers import Qwen2Config
+
+    fields = {
+        "Qwen/Qwen2.5-0.5B-Instruct": dict(
+            hidden_size=896, intermediate_size=4864, num_attention_heads=14, num_key_value_heads=2
+        ),
+        "Qwen/Qwen2.5-1.5B-Instruct": dict(
+            hidden_size=1536, intermediate_size=8960, num_attention_heads=12, num_key_value_heads=2
+        ),
+    }
+
+    def from_config(model_name, *args, **kwargs):
+        return Qwen2Config(**fields[model_name])
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", from_config)
+
+
+@pytest.mark.parametrize("model_name", sorted(KNOWN_MODELS))
+def test_dims_from_the_live_config_agree_with_the_offline_table(local_config, model_name):
+    """Pins the two dim sources to each other.
+
+    Every other CLI test forces the fallback, so the derivation Phase 1 actually
+    uses is otherwise never executed, and drift between it and KNOWN_MODELS
+    (a renamed config field, a head_dim that stops being hidden // heads) would
+    only show up as a wrong sweep.
+    """
+    dims, source = _dims_for_model(model_name, DEFAULT_TARGET_MODULES)
+    assert source == "transformers AutoConfig"
+    assert dims == KNOWN_MODELS[model_name]
+
+
+def test_dims_for_model_falls_back_to_the_offline_table(offline):
+    dims, source = _dims_for_model("Qwen/Qwen2.5-0.5B-Instruct", DEFAULT_TARGET_MODULES)
+    assert set(dims) == set(DEFAULT_TARGET_MODULES)
+    assert "KNOWN_MODELS" in source
+
+
+def test_dims_for_model_says_how_to_onboard_an_unknown_model(offline):
+    """Offline is the normal state in CI, so this is the first error a second model hits.
+
+    It is also the only place that says what to do about it.
+    """
+    with pytest.raises(SystemExit, match="KNOWN_MODELS"):
+        _dims_for_model("some-org/not-in-the-table", DEFAULT_TARGET_MODULES)
+
+
+def test_dims_for_model_rejects_an_unresolvable_module_name(offline):
+    with pytest.raises(SystemExit, match="fc1"):
+        _dims_for_model("Qwen/Qwen2.5-0.5B-Instruct", ("q_proj", "fc1"))
+
+
+def test_sweep_cli_does_not_report_success_after_checking_nothing(offline):
+    """A typo'd module name must not buy a green light on an unvalidated sweep."""
+    from adagralora.patching import main
+
+    with pytest.raises(SystemExit):
+        main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "16", "--target-modules", "fc1", "fc2"])
+
+
+def test_sweep_cli_reports_success_for_a_workable_grid(offline, capsys):
+    from adagralora.patching import main
+
+    assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "16", "--json"]) == 0
+    assert "q_proj" in capsys.readouterr().out
+
+
+def test_sweep_cli_reports_success_on_the_human_readable_path(offline, capsys):
+    """Every other success-path test passes --json, and every printed-path one exits 1."""
+    from adagralora.patching import main
+
+    assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "16"]) == 0
+    assert "legal for every targeted module: [2, 4, 8]" in capsys.readouterr().out
+
+
+def test_sweep_cli_fails_on_a_rank_with_no_legal_k(offline, capsys):
+    """The exit code the README promises, on the human-readable path it documents."""
+    from adagralora.patching import main
+
+    assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "3"]) == 1
+    captured = capsys.readouterr()
+    assert "NONE" in captured.out
+    assert "no legal k" in captured.err
+
+
+def test_sweep_cli_fails_on_an_impossible_rank(offline, capsys):
+    """r=0 divides by every k, so an unguarded sweep greenlights it and exits 0."""
+    from adagralora.patching import main
+
+    assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "0"]) == 1
+    assert "NONE" in capsys.readouterr().out
+
+
+def test_sweep_cli_fails_on_a_rank_with_no_legal_k_in_json_mode(offline, capsys):
+    """A machine-readable sweep must not disagree with the printed one about pass/fail."""
+    from adagralora.patching import main
+
+    assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "3", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["legal_k"]["3"]["q_proj"] == []

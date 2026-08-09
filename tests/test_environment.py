@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 
 
 def test_update_layer_has_the_signature_the_patcher_calls():
@@ -37,6 +38,25 @@ def test_gralora_has_no_bitsandbytes_backend():
 
     files = os.listdir(os.path.dirname(gralora_pkg.__file__))
     assert "bnb.py" not in files
+
+
+def _floor(requires_python: str) -> tuple[int, ...]:
+    """Parse a '>=X.Y' specifier into a comparable (major, minor)."""
+    return tuple(int(part) for part in requires_python.strip().lstrip(">=").split(".")[:2])
+
+
+def test_declared_python_floor_is_at_least_what_the_pinned_peft_needs():
+    """A floor below peft's promises an install pip cannot actually resolve.
+
+    The CI matrix starts at 3.10, so nothing else exercises the declared floor.
+    """
+    from importlib.metadata import metadata
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        declared = re.search(r'requires-python\s*=\s*"([^"]+)"', fh.read()).group(1)
+
+    assert _floor(declared) >= _floor(metadata("peft")["Requires-Python"])
 
 
 def test_adagralora_exposes_its_phase_zero_surface():

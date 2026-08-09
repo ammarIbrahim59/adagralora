@@ -98,6 +98,11 @@ def validate_k(r: int, in_features: int, out_features: int, k: int, *, where: st
     """
     if not isinstance(k, int) or k <= 0:
         raise KConstraintError(f"{where}: gralora_k must be a positive integer, got {k!r}")
+    # Without this, r <= 0 divides evenly by every k and the sweep reports an
+    # impossible rank as fully legal; the builder would only fail later, inside
+    # update_layer, part-way through wrapping.
+    if not isinstance(r, int) or r <= 0:
+        raise KConstraintError(f"{where}: r must be a positive integer, got {r!r}")
 
     problems = []
     if r % k != 0:
@@ -171,7 +176,14 @@ def validate_k_map(
 
     resolved: dict[str, int] = {}
     for name, (in_f, out_f) in dims.items():
-        k = int(k_map.get(name, default_k))
+        raw = k_map.get(name, default_k)
+        # Coercion is wanted for the values that genuinely round-trip as integers
+        # (a JSON 4, a numpy int) but not for the ones int() would truncate: an
+        # allocator that emits 2.9 would build at k=2 and then record 2 in
+        # k_map.json, indistinguishable downstream from a k that was asked for.
+        if isinstance(raw, bool) or int(raw) != raw:
+            raise KConstraintError(f"{name}: gralora_k must be an integer, got {raw!r}")
+        k = int(raw)
         validate_k(r, in_f, out_f, k, where=name)
         resolved[name] = k
     return resolved
@@ -195,6 +207,7 @@ def build_mixed_gralora(
     init_weights: bool = True,
     adapter_name: str = "default",
     task_type: Optional[str] = None,
+    autocast_adapter_dtype: bool = True,
 ):
     """Attach GraLoRA to ``model`` with a per-layer ``k``.
 
@@ -206,6 +219,10 @@ def build_mixed_gralora(
     ``k``. This keeps construction from tripping over a ``default_k`` that is
     illegal for some layer, and costs nothing extra: the allocation is the same
     size at every ``k``.
+
+    ``autocast_adapter_dtype`` means the same thing it does in
+    ``get_peft_model``: keep the adapter tensors in fp32 over a half-precision
+    base.
     """
     dims = module_dims(model, target_modules)
     if not dims:
@@ -227,7 +244,12 @@ def build_mixed_gralora(
     if task_type is not None:
         config_kwargs["task_type"] = task_type
 
-    peft_model = get_peft_model(model, GraloraConfig(**config_kwargs), adapter_name=adapter_name)
+    peft_model = get_peft_model(
+        model,
+        GraloraConfig(**config_kwargs),
+        adapter_name=adapter_name,
+        autocast_adapter_dtype=autocast_adapter_dtype,
+    )
 
     patched = 0
     for name, module in peft_model.named_modules():
@@ -246,6 +268,15 @@ def build_mixed_gralora(
             f"Expected to patch {len(resolved)} GraLoRA layers but patched {patched}. "
             "PEFT may have skipped a targeted module."
         )
+
+    # get_peft_model upcasts the adapters to fp32 once, at injection time, and
+    # update_layer ends by moving each rebuilt tensor to the base layer's dtype —
+    # so every layer patched above came back down to fp16/bf16 on a half-precision
+    # base. Half-precision adapter weights are the usual cause of NaN loss there,
+    # which is exactly what PEFT's default was protecting against.
+    peft_model.base_model._cast_adapter_dtype(
+        adapter_name=adapter_name, autocast_adapter_dtype=autocast_adapter_dtype
+    )
 
     # The stored config keeps one global k for compatibility with PEFT's loader;
     # the authoritative per-layer map is written out beside it as k_map.json.
@@ -309,7 +340,16 @@ def _dims_for_model(model_name: str, target_modules: Sequence[str]) -> tuple[dic
         dims = dict(KNOWN_MODELS[model_name])
         source = "KNOWN_MODELS offline table"
 
-    return {m: dims[m] for m in target_modules if m in dims}, source
+    # Silently dropping an unrecognised name would leave the sweep reporting
+    # "all legal" over an empty set of modules — a green light on nothing.
+    missing = [m for m in target_modules if m not in dims]
+    if missing:
+        raise SystemExit(
+            f"{missing} are not known projection names for this architecture; "
+            f"known: {sorted(dims)}"
+        )
+
+    return {m: dims[m] for m in target_modules}, source
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -19,14 +19,14 @@ import json
 import os
 import platform
 import subprocess
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import torch.nn as nn
 
 from peft import PeftModel
 from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 
-from adagralora.patching import build_mixed_gralora, current_k_map
+from adagralora.patching import build_mixed_gralora, current_k_map, module_dims
 
 K_MAP_FILENAME = "k_map.json"
 METADATA_FILENAME = "run_metadata.json"
@@ -88,6 +88,25 @@ def read_k_map(adapter_dir: str) -> dict[str, Any]:
     return payload
 
 
+def _resolve_adapter_dir(adapter_dir: str, adapter_name: str) -> str:
+    """Find the directory the sidecar actually landed in.
+
+    ``save_mixed_adapter`` follows PEFT and puts a non-default adapter one level
+    down, so the directory a caller saved *to* is not the directory the sidecar
+    is *in*. Accept either, or the loader tells an operator their checkpoint was
+    never saved by ``save_mixed_adapter`` when in fact it was.
+
+    The subdirectory has to win over the directory itself: a sweep that saves a
+    default adapter and a named one into one run dir leaves a k_map.json at both
+    levels, and only the nested one belongs to the requested name.
+    """
+    if adapter_name != "default":
+        nested = os.path.join(adapter_dir, adapter_name)
+        if os.path.isfile(os.path.join(nested, K_MAP_FILENAME)):
+            return nested
+    return adapter_dir
+
+
 def load_mixed_adapter(
     base_model: nn.Module,
     adapter_dir: str,
@@ -100,8 +119,26 @@ def load_mixed_adapter(
 
     Layers are constructed at their saved ``k`` first, so the shapes match
     before any tensor is copied in.
+
+    ``adapter_dir`` may be either the directory ``save_mixed_adapter`` was given
+    or, for a non-default ``adapter_name``, the subdirectory it wrote into.
+
+    ``task_type`` overrides what the checkpoint recorded; left unset, the
+    saved value is used, so an evaluate/resume path cannot silently downgrade
+    a ``PeftModelForCausalLM`` to a bare ``PeftModel``.
     """
+    adapter_dir = _resolve_adapter_dir(adapter_dir, adapter_name)
     payload = read_k_map(adapter_dir)
+    # Resolution can only pick a directory; the sidecar is the one record of which
+    # adapter is actually in it. Without this check a run dir holding more than one
+    # hands back whichever one resolution landed on, under the requested name.
+    saved_name = payload.get("adapter_name")
+    if saved_name is not None and saved_name != adapter_name:
+        raise RuntimeError(
+            f"{os.path.join(adapter_dir, K_MAP_FILENAME)} was saved from adapter {saved_name!r}, "
+            f"but {adapter_name!r} was requested. Point adapter_dir at that adapter's own "
+            f"directory, or load it under the name it was saved with."
+        )
     k_map = {name: int(k) for name, k in payload["k_map"].items()}
 
     with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as fh:
@@ -110,6 +147,23 @@ def load_mixed_adapter(
     target_modules = payload.get("target_modules") or adapter_config.get("target_modules")
     if target_modules is None:
         raise ValueError("Cannot determine target_modules from the saved adapter.")
+
+    if task_type is None:
+        task_type = adapter_config.get("task_type")
+
+    # The mirror of the check below: a checkpoint covering layers this base model
+    # does not have. The builder's validator would raise a bare KeyError naming
+    # them but never naming the cause, and the cause is the same wrong-base-model
+    # mistake, so it gets the same error type and the same question.
+    targeted = module_dims(base_model, sorted(target_modules))
+    absent = sorted(set(k_map) - set(targeted))
+    if absent:
+        raise RuntimeError(
+            f"The checkpoint covers layers this base model does not target.\n"
+            f"  in the checkpoint, not targeted here : {absent[:5]}{' ...' if len(absent) > 5 else ''}\n"
+            f"The base model has {len(targeted)} targeted layers and the checkpoint covers "
+            f"{len(k_map)} — is this the base model the adapter was trained on?"
+        )
 
     peft_model = build_mixed_gralora(
         base_model,
@@ -120,11 +174,33 @@ def load_mixed_adapter(
         alpha=int(payload["alpha"]),
         gralora_dropout=float(payload["gralora_dropout"]),
         hybrid_r=int(payload["hybrid_r"]),
-        # Weights are about to be overwritten; skip the init RNG work.
+        # This is the branch that zero-initialises gralora_B, so a tensor that
+        # fails to load stays exactly zero and is detectable instead of being
+        # masked by plausible-looking random values.
         init_weights=True,
         adapter_name=adapter_name,
         task_type=task_type,
     )
+
+    # A postcondition of the builder, checked before any weight is copied: once
+    # the tensors are in, a k disagreement only surfaces as a shape mismatch.
+    reloaded = current_k_map(peft_model, adapter_name)
+    if reloaded != k_map:
+        # Diffed both ways round: the disagreement this check uniquely catches is a
+        # base model whose targeted layers the checkpoint never covered (an eval or
+        # resume pointed at the wrong-size base), and that shows up only as names
+        # the saved map has never heard of.
+        uncovered = sorted(set(reloaded) - set(k_map))
+        absent = sorted(set(k_map) - set(reloaded))
+        differing = sorted(n for n in set(k_map) & set(reloaded) if reloaded[n] != k_map[n])
+        raise RuntimeError(
+            f"Rebuilt k-map does not match the saved one.\n"
+            f"  different k                          : {differing[:5]}{' ...' if len(differing) > 5 else ''}\n"
+            f"  targeted here, not in the checkpoint : {uncovered[:5]}{' ...' if len(uncovered) > 5 else ''}\n"
+            f"  in the checkpoint, not targeted here : {absent[:5]}{' ...' if len(absent) > 5 else ''}\n"
+            f"The base model has {len(reloaded)} targeted layers and the checkpoint covers "
+            f"{len(k_map)} — is this the base model the adapter was trained on?"
+        )
 
     state_dict = load_peft_weights(adapter_dir)
     result = set_peft_model_state_dict(peft_model, state_dict, adapter_name=adapter_name)
@@ -141,18 +217,13 @@ def load_mixed_adapter(
                 f"  unexpected keys      : {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}"
             )
 
-    reloaded = current_k_map(peft_model, adapter_name)
-    if reloaded != k_map:
-        differing = [n for n in k_map if reloaded.get(n) != k_map[n]]
-        raise RuntimeError(f"Rebuilt k-map does not match the saved one at: {differing[:5]}")
-
     return peft_model
 
 
-def _git_commit(cwd: Optional[str] = None) -> Optional[str]:
+def _git(args: Sequence[str], cwd: Optional[str] = None) -> Optional[str]:
     try:
         out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", *args],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -164,6 +235,20 @@ def _git_commit(cwd: Optional[str] = None) -> Optional[str]:
         return None
 
 
+def _git_commit(cwd: Optional[str] = None) -> Optional[str]:
+    return _git(["rev-parse", "HEAD"], cwd)
+
+
+def _git_dirty(cwd: Optional[str] = None) -> Optional[bool]:
+    """Whether the tree had uncommitted edits. ``None`` if git could not answer.
+
+    A commit hash alone is misleading provenance when the run was launched with
+    local edits: it names code that never executed.
+    """
+    status = _git(["status", "--porcelain"], cwd)
+    return None if status is None else bool(status)
+
+
 def save_run_metadata(
     output_dir: str,
     extra: Optional[Mapping[str, Any]] = None,
@@ -173,13 +258,16 @@ def save_run_metadata(
 ) -> str:
     """Write provenance for a run so every number in the paper traces to a commit.
 
-    Deliberately avoids wall-clock-only identifiers: the git commit and the
-    resolved k-map are what make a result reproducible.
+    Deliberately avoids wall-clock-only identifiers: the git commit (plus
+    whether the tree was dirty when it ran) and the resolved k-map are what
+    make a result reproducible.
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    repo = os.path.dirname(os.path.abspath(__file__))
     metadata: dict[str, Any] = {
-        "git_commit": _git_commit(os.path.dirname(os.path.abspath(__file__))),
+        "git_commit": _git_commit(repo),
+        "git_dirty": _git_dirty(repo),
         "python": platform.python_version(),
         "platform": platform.platform(),
     }
@@ -208,6 +296,12 @@ def save_run_metadata(
         )
 
     if extra:
+        # Flat layout keeps downstream aggregation simple, so a caller key that
+        # collides with a provenance field has to be a hard error rather than a
+        # silent overwrite of the very thing this file exists to record.
+        collisions = sorted(set(extra) & set(metadata))
+        if collisions:
+            raise ValueError(f"extra may not overwrite recorded provenance fields: {collisions}")
         metadata.update(dict(extra))
 
     path = os.path.join(output_dir, METADATA_FILENAME)

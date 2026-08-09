@@ -30,11 +30,22 @@ jobs:
           pip install -r requirements.txt
           pip install -e .
 
+      # Runners have a network, so "no downloads" is only a promise until it is
+      # enforced: offline mode turns a test that quietly reaches the Hub into a
+      # CI failure instead of a silent dependency on Hub availability.
       - name: Environment check
         # Asserts the pinned peft still exposes the update_layer signature the
         # mixed-k patcher calls, and that GraLoRA still has no bnb backend.
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_DATASETS_OFFLINE: "1"
         run: python environment_check.py
 
       - name: Tests
         # CPU only, no model downloads, no network.
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_DATASETS_OFFLINE: "1"
         run: pytest -q

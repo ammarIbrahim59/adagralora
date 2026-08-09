@@ -68,9 +68,9 @@ class TinyDecoder(nn.Module):
 
 @pytest.fixture
 def tiny_model():
-    def _make(seed: int = 0):
+    def _make(seed: int = 0, n_layers: int = 2):
         torch.manual_seed(seed)
-        return TinyDecoder()
+        return TinyDecoder(n_layers)
 
     return _make
 
@@ -79,3 +79,30 @@ def tiny_model():
 def sample_input():
     torch.manual_seed(1234)
     return torch.randn(2, 5, HIDDEN)
+
+
+@pytest.fixture
+def tiny_causal_lm():
+    """A real (config-constructed, never downloaded) causal LM.
+
+    TinyDecoder is enough for everything except task_type: PEFT's task-specific
+    wrappers need a genuine transformers model. Dimensions match TinyDecoder's,
+    so the same k values stay legal.
+    """
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    def _make(seed: int = 0):
+        torch.manual_seed(seed)
+        return LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=64,
+                hidden_size=HIDDEN,
+                intermediate_size=INTERMEDIATE,
+                num_hidden_layers=2,
+                num_attention_heads=HIDDEN // KV,
+                num_key_value_heads=1,
+                max_position_embeddings=32,
+            )
+        )
+
+    return _make

@@ -7,7 +7,8 @@ name = "adagralora"
 version = "0.1.0"
 description = "Layer-wise adaptive block allocation for GraLoRA"
 readme = "README.md"
-requires-python = ">=3.9"
+# peft==0.20.0 (and every other dependency below) declares Requires-Python >=3.10.
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = [
     # Pinned exactly: the mixed-k patcher re-invokes GraloraLayer.update_layer
