@@ -26,10 +26,17 @@ import torch.nn as nn
 from peft import PeftModel
 from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 
-from adagralora.patching import build_mixed_gralora, current_k_map, module_dims
+from adagralora.patching import (
+    build_mixed_gralora,
+    current_k_map,
+    module_dims,
+    trainable_parameter_count,
+)
 
 K_MAP_FILENAME = "k_map.json"
 METADATA_FILENAME = "run_metadata.json"
+#: Either name PEFT will have written the adapter tensors under.
+_WEIGHT_FILENAMES = ("adapter_model.safetensors", "adapter_model.bin")
 _K_MAP_FORMAT_VERSION = 1
 
 
@@ -139,6 +146,17 @@ def load_mixed_adapter(
             f"but {adapter_name!r} was requested. Point adapter_dir at that adapter's own "
             f"directory, or load it under the name it was saved with."
         )
+    # load_peft_weights treats a directory with no weights file as a Hub repo id, so
+    # a checkpoint that lost its tensors (a copy that skipped the large binaries)
+    # would rebuild the whole model and then fail complaining about a repo named
+    # "runs/seed0" — or actually go looking for one online.
+    if not any(os.path.isfile(os.path.join(adapter_dir, name)) for name in _WEIGHT_FILENAMES):
+        raise FileNotFoundError(
+            f"{adapter_dir} has a {K_MAP_FILENAME} but none of {list(_WEIGHT_FILENAMES)}. "
+            "This checkpoint is incomplete — its adapter weights were never written or did not "
+            "survive the copy."
+        )
+
     k_map = {name: int(k) for name, k in payload["k_map"].items()}
 
     with open(os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8") as fh:
@@ -279,7 +297,13 @@ def save_run_metadata(
         metadata["cuda_available"] = bool(torch.cuda.is_available())
         if torch.cuda.is_available():
             metadata["gpu"] = torch.cuda.get_device_name(0)
-            metadata["peak_vram_bytes"] = int(torch.cuda.max_memory_allocated())
+            # Named for what it is: the allocator's high-water mark since the process
+            # started, not this run's peak. Nothing here owns a "run begins" moment at
+            # which to call reset_peak_memory_stats, so a driver that trains several
+            # allocations in one process records the max over all of them — a number
+            # that would look like "memory does not vary with k" if it were reported
+            # as this run's.
+            metadata["peak_vram_bytes_process"] = int(torch.cuda.max_memory_allocated())
     except Exception:
         pass
 
@@ -291,9 +315,9 @@ def save_run_metadata(
 
     if peft_model is not None:
         metadata["k_map"] = current_k_map(peft_model, adapter_name)
-        metadata["trainable_params"] = sum(
-            p.numel() for p in peft_model.parameters() if p.requires_grad
-        )
+        # Via the helper the budget-matching tests already pin, so the number in the
+        # paper and the number those tests assert cannot drift apart.
+        metadata["trainable_params"] = trainable_parameter_count(peft_model)
 
     if extra:
         # Flat layout keeps downstream aggregation simple, so a caller key that

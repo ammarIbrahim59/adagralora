@@ -37,6 +37,7 @@ import torch.nn as nn
 
 from peft import GraloraConfig, get_peft_model
 from peft.tuners.gralora import GraloraLayer
+from peft.tuners.tuners_utils import BaseTunerLayer
 
 DEFAULT_TARGET_MODULES: tuple[str, ...] = (
     "q_proj",
@@ -143,14 +144,43 @@ def module_dims(
     Matches the same way PEFT does: a module is targeted when its dotted path
     ends with one of ``target_modules``.
     """
+    # tuple("q_proj") splits a bare string into characters, so the mistake would
+    # otherwise surface as "no modules matched target_modules=['q','_','p',...]".
+    if isinstance(target_modules, str):
+        raise TypeError(f"target_modules must be a sequence of names, not the string {target_modules!r}")
     suffixes = tuple(target_modules)
     dims: dict[str, tuple[int, int]] = {}
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
+    first_path: dict[int, str] = {}
+    unsupported: dict[str, str] = {}
+    # remove_duplicate=True (the default) reports a module reachable at two paths
+    # once, under the first path only — and PEFT's injector deduplicates the same
+    # way, so it wraps the first path and leaves the second parent holding the raw
+    # layer. Both the resolved map and the patched count are computed from that
+    # same deduplicated view, so they always agree and the builder's postcondition
+    # structurally cannot see the skipped alias.
+    for name, module in model.named_modules(remove_duplicate=False):
         canon = canonical_name(name)
-        if canon.split(".")[-1] in suffixes:
-            dims[canon] = (module.in_features, module.out_features)
+        if canon.split(".")[-1] not in suffixes:
+            continue
+        if not isinstance(module, nn.Linear):
+            unsupported.setdefault(canon, type(module).__name__)
+            continue
+        seen_as = first_path.setdefault(id(module), canon)
+        if seen_as != canon:
+            raise ValueError(
+                f"targeted layers {seen_as!r} and {canon!r} are the same shared module; "
+                "GraLoRA cannot give one module two k values, and PEFT would adapt only the first."
+            )
+        dims[canon] = (module.in_features, module.out_features)
+
+    if unsupported:
+        offenders = sorted(unsupported.items())[:3]
+        raise TypeError(
+            f"{len(unsupported)} targeted module(s) are not nn.Linear, e.g. "
+            f"{[f'{n} ({t})' for n, t in offenders]}. The module names are fine; this builder "
+            "only wraps nn.Linear. PEFT's GraLoRA also accepts transformers Conv1D (the GPT-2 "
+            "family), but the mixed-k patcher does not derive dims for it."
+        )
     return dims
 
 
@@ -224,6 +254,19 @@ def build_mixed_gralora(
     ``get_peft_model``: keep the adapter tensors in fp32 over a half-precision
     base.
     """
+    # GraloraLayer subclasses nn.Linear, so a second build over an already-wrapped
+    # model re-collects the wrapped layers and update_layer rewrites the *first*
+    # model's k in place: both handles then alias one set of modules and produce
+    # identical outputs. A k sweep that reuses one expensively loaded base model is
+    # exactly that shape, and PEFT only warns.
+    attached = sorted(canonical_name(n) for n, m in model.named_modules() if isinstance(m, BaseTunerLayer))
+    if attached or getattr(model, "peft_config", None):
+        raise RuntimeError(
+            f"This model already has adapters attached ({len(attached)} layer(s), e.g. {attached[:3]}). "
+            "Each adapter needs its own freshly constructed base model; call .unload() on this one first "
+            "if you mean to reuse it."
+        )
+
     dims = module_dims(model, target_modules)
     if not dims:
         raise ValueError(

@@ -117,6 +117,38 @@ def test_module_dims_respects_a_narrower_target_list(tiny_model):
     assert len(dims) == 4
 
 
+def test_module_dims_rejects_a_targeted_module_shared_by_two_parents():
+    """named_modules() hides an aliased module, and so does PEFT's injector.
+
+    Both dedupe to the first path, so the second parent silently keeps the raw
+    layer while the resolved map and the patched count still agree — the
+    builder's postcondition cannot see it. Failing loudly is the only option:
+    one module cannot hold two k values.
+    """
+    shared = torch.nn.Linear(96, 96, bias=False)
+    block = torch.nn.Module()
+    block.q_proj = shared
+    block.v_proj = shared
+    with pytest.raises(ValueError, match="same shared module"):
+        module_dims(block, target_modules=("q_proj", "v_proj"))
+
+
+def test_module_dims_names_the_type_of_an_unsupported_targeted_module():
+    """GPT-2's projections are Conv1D, and the module names are not the problem."""
+    from transformers.pytorch_utils import Conv1D
+
+    block = torch.nn.Module()
+    block.c_attn = Conv1D(24, 8)
+    with pytest.raises(TypeError, match="Conv1D"):
+        module_dims(block, target_modules=("c_attn",))
+
+
+def test_module_dims_rejects_a_bare_string_target_list(tiny_model):
+    """tuple("q_proj") is a tuple of six characters, which matches nothing."""
+    with pytest.raises(TypeError, match="not the string"):
+        module_dims(tiny_model(), target_modules="q_proj")
+
+
 # --- validate_k_map --------------------------------------------------------
 
 
@@ -203,6 +235,34 @@ def test_build_rejects_a_non_positive_rank_before_allocating(tiny_model, monkeyp
 def test_build_rejects_a_target_list_that_matches_nothing(tiny_model):
     with pytest.raises(ValueError, match="No nn.Linear modules matched"):
         build_mixed_gralora(tiny_model(), r=16, target_modules=("nonexistent_proj",))
+
+
+def test_build_refuses_a_model_that_already_carries_adapters(tiny_model, sample_input):
+    """The k-sweep-over-one-loaded-base-model shape, which PEFT only warns about.
+
+    GraloraLayer is an nn.Linear, so a second build re-collects the wrapped
+    layers and update_layer rewrites the *first* model's k in place: the two
+    handles alias one model and their outputs become bit-identical.
+    """
+    base = tiny_model()
+    first = build_mixed_gralora(base, r=16, default_k=2)
+    with pytest.raises(RuntimeError, match="already has adapters"):
+        build_mixed_gralora(base, r=16, default_k=8)
+    assert set(current_k_map(first).values()) == {2}
+
+
+def test_build_can_skip_the_identity_initialisation(tiny_model, sample_input):
+    """init_weights=False is the only way to get a non-zero B at build time.
+
+    Nothing else calls it, so a regression that ignored the flag would leave
+    every adapter a no-op with the whole suite green.
+    """
+    base = tiny_model()
+    with torch.no_grad():
+        expected = base(sample_input).clone()
+    peft_model = build_mixed_gralora(base, r=16, default_k=4, init_weights=False)
+    with torch.no_grad():
+        assert not torch.allclose(expected, peft_model(sample_input), atol=1e-6)
 
 
 def test_build_is_identity_at_initialisation(tiny_model, sample_input):
@@ -334,6 +394,11 @@ def test_representative_k_is_the_most_common_when_mixed():
     assert _representative_k({"a": 2, "b": 2, "c": 8}) == 2
 
 
+def test_representative_k_breaks_a_tie_towards_the_smaller_k():
+    """Half-and-half is the likeliest mixed map of all, and max() alone is arbitrary."""
+    assert _representative_k({"a": 2, "b": 8}) == 2
+
+
 # --- offline model table ---------------------------------------------------
 
 
@@ -453,7 +518,27 @@ def test_sweep_cli_fails_on_a_rank_with_no_legal_k(offline, capsys):
     assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "3"]) == 1
     captured = capsys.readouterr()
     assert "NONE" in captured.out
+    # The aggregate line is what an operator acts on, and it is an intersection:
+    # asserted only where every module is legal, a union would read identically.
+    assert "legal for every targeted module: NONE" in captured.out
     assert "no legal k" in captured.err
+
+
+def test_sweep_cli_aggregates_a_partially_legal_rank_by_intersection(offline, capsys):
+    """The case that separates intersection from union.
+
+    Every module's dims are divisible by every power of two up to 128, so a
+    power-of-two grid is legal everywhere and cannot tell the two apart. k=14 at
+    r=28 can: it divides the 896-wide projections but not the 4864-wide MLP, so
+    a union would advertise a k that some layer cannot build.
+    """
+    from adagralora.patching import main
+
+    assert main(["--model", "Qwen/Qwen2.5-0.5B-Instruct", "--r", "28", "--k", "2", "14"]) == 0
+    out = capsys.readouterr().out
+    assert "legal for every targeted module: [2]" in out
+    assert "q_proj     in=896    out=896     legal k: 2, 14" in out
+    assert "down_proj  in=4864   out=896     legal k: 2" in out
 
 
 def test_sweep_cli_fails_on_an_impossible_rank(offline, capsys):

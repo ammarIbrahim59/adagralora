@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ from adagralora.io_utils import (
     save_mixed_adapter,
     save_run_metadata,
 )
-from adagralora.patching import build_mixed_gralora, current_k_map
+from adagralora.patching import build_mixed_gralora, current_k_map, trainable_parameter_count
 
 MIXED_K_MAP = {
     "layers.0.self_attn.q_proj": 8,
@@ -317,9 +318,46 @@ def test_roundtrip_restores_a_non_default_config(tmp_path, tiny_model, sample_in
     assert payload["gralora_dropout"] == pytest.approx(0.1)
 
     reloaded = load_mixed_adapter(tiny_model(seed=2), out_dir)
+    # The output comparison below runs in eval(), where dropout is a no-op, so it
+    # cannot see a dropout silently reset to 0.0 on the load side — only the
+    # rebuilt modules can. An unused dropout is nn.Identity, which has no .p.
+    assert {m.p for n, m in reloaded.named_modules() if n.endswith("gralora_dropout.default")} == {0.1}
+
     reloaded.eval()
     with torch.no_grad():
         assert torch.allclose(reference, reloaded(sample_input), atol=1e-5)
+
+
+def test_roundtrip_restores_a_non_default_rank_and_target_list(tmp_path, tiny_model, sample_input):
+    """r and target_modules come from the sidecar too, and every other test uses the defaults.
+
+    Both are hardcodable on either side of the round trip with the rest of the
+    suite green; an r mismatch then reloads as a shape error and a target-module
+    mismatch as a rebuilt-k-map error, both after a training run.
+    """
+    peft_model = build_mixed_gralora(
+        tiny_model(seed=4),
+        r=32,
+        k_map={"layers.0.self_attn.q_proj": 8},
+        default_k=2,
+        target_modules=("q_proj", "v_proj"),
+    )
+    _train_a_little(peft_model)
+    peft_model.eval()
+    with torch.no_grad():
+        reference = peft_model(sample_input).clone()
+
+    out_dir = str(tmp_path / "narrow")
+    save_mixed_adapter(peft_model, out_dir)
+    assert read_k_map(out_dir)["target_modules"] == ["q_proj", "v_proj"]
+
+    reloaded = load_mixed_adapter(tiny_model(seed=4), out_dir)
+    reloaded.eval()
+    with torch.no_grad():
+        assert torch.allclose(reference, reloaded(sample_input), atol=1e-5)
+    installed = current_k_map(reloaded)
+    assert len(installed) == 4
+    assert installed["layers.0.self_attn.q_proj"] == 8
 
 
 def _drop_one_tensor(adapter_dir: str) -> str:
@@ -391,6 +429,76 @@ def test_an_explicit_task_type_overrides_what_the_checkpoint_recorded(tmp_path, 
     assert type(reloaded).__name__ == "PeftModelForCausalLM"
 
 
+def test_load_refuses_a_base_model_that_already_carries_an_adapter(
+    saved_mixed_adapter, tmp_path, tiny_model
+):
+    """The natural sweep-eval pattern: load the expensive base once, then each arm.
+
+    The loader wraps in place, so a second call over the same object re-injects
+    on top of the first and overwrites every tensor under the same adapter name.
+    Both handles then alias one model and every arm reports whichever checkpoint
+    was loaded last — the silent cross-checkpoint mix-up this module exists to
+    prevent.
+    """
+    out_dir, _ = saved_mixed_adapter
+    other_dir = str(tmp_path / "other")
+    save_mixed_adapter(build_mixed_gralora(tiny_model(seed=0), r=16, default_k=4), other_dir)
+
+    base = tiny_model(seed=0)
+    first = load_mixed_adapter(base, out_dir)
+    with pytest.raises(RuntimeError, match="already has adapters"):
+        load_mixed_adapter(base, other_dir)
+    assert current_k_map(first)["layers.0.self_attn.q_proj"] == 8
+
+
+def test_load_rejects_a_checkpoint_whose_weights_are_missing(saved_mixed_adapter, tiny_model):
+    """A copy that skipped the large binaries leaves the sidecar and the config behind.
+
+    Without this the whole model is rebuilt first and load_peft_weights then
+    treats the run directory as a Hub repo id — so the operator is told about a
+    repo that does not exist instead of about the checkpoint that is incomplete.
+    """
+    out_dir, _ = saved_mixed_adapter
+    os.remove(os.path.join(out_dir, "adapter_model.safetensors"))
+    with pytest.raises(FileNotFoundError, match="incomplete"):
+        load_mixed_adapter(tiny_model(seed=0), out_dir)
+
+
+def test_strict_load_rejects_a_checkpoint_with_an_extra_tensor(saved_mixed_adapter, tiny_model):
+    """The other half of the strict check: a key the rebuilt model has no home for.
+
+    A checkpoint from a differently targeted run loads its overlapping tensors
+    happily and drops the rest on the floor.
+    """
+    from safetensors.torch import load_file, save_file
+
+    out_dir, _ = saved_mixed_adapter
+    path = os.path.join(out_dir, "adapter_model.safetensors")
+    tensors = load_file(path)
+    donor = next(name for name in tensors if "q_proj.gralora_A" in name)
+    tensors[donor.replace("q_proj", "w_proj")] = tensors[donor].clone()
+    save_file(tensors, path)
+
+    with pytest.raises(RuntimeError, match="unexpected keys"):
+        load_mixed_adapter(tiny_model(seed=0), out_dir)
+
+
+def test_the_k_map_check_runs_before_any_weight_is_read(saved_mixed_adapter, tiny_model, monkeypatch):
+    """Ordering, not just presence: once tensors are in, a k disagreement is a shape error.
+
+    Weight loading is made to explode, so the only way the k-map error can win is
+    if it is raised first.
+    """
+
+    def explode(*args, **kwargs):
+        raise AssertionError("weights were read before the k-map was checked")
+
+    monkeypatch.setattr("adagralora.io_utils.load_peft_weights", explode)
+    out_dir, _ = saved_mixed_adapter
+    with pytest.raises(RuntimeError, match="Rebuilt k-map"):
+        load_mixed_adapter(tiny_model(seed=0, n_layers=4), out_dir)
+
+
 def test_save_run_metadata_records_provenance(tmp_path, tiny_model):
     peft_model = build_mixed_gralora(tiny_model(), r=16, k_map=MIXED_K_MAP, default_k=2)
     out_dir = str(tmp_path / "run")
@@ -402,7 +510,26 @@ def test_save_run_metadata_records_provenance(tmp_path, tiny_model):
     assert metadata["allocator"] == "gradnorm"
     assert metadata["peft"] is not None
     assert metadata["k_map"]["layers.0.self_attn.q_proj"] == 8
-    assert metadata["trainable_params"] > 0
+    # The exact count, not just its truthiness: this is the number the whole
+    # budget-matching claim rests on, so it has to be the model's own.
+    assert metadata["trainable_params"] == trainable_parameter_count(peft_model)
+
+
+def test_save_run_metadata_records_this_repos_commit(tmp_path):
+    """The recorded hash has to be *this* checkout's HEAD.
+
+    A constant, or a lookup run from outside the work tree, is indistinguishable
+    from real provenance in a file nobody reads until the paper is written.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    head = subprocess.run(
+        ["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    if head.returncode != 0:
+        pytest.skip("not a git checkout (source tarball)")
+
+    metadata = json.loads(open(save_run_metadata(str(tmp_path / "run"))).read())
+    assert metadata["git_commit"] == head.stdout.strip()
 
 
 def test_save_run_metadata_records_whether_the_tree_was_dirty(tmp_path):
@@ -415,6 +542,43 @@ def test_save_run_metadata_records_whether_the_tree_was_dirty(tmp_path):
     # provenance to "unknown" with nothing noticing.
     if metadata["git_commit"] is not None:
         assert isinstance(metadata["git_dirty"], bool)
+
+
+def test_git_dirty_actually_flips_when_the_tree_has_edits(tmp_path):
+    """Run against a scratch repo, since this project's own tree must not be touched.
+
+    Nothing else distinguishes "clean" from "always says clean", and the whole
+    point of the field is to catch a run launched from uncommitted code.
+    """
+    from adagralora.io_utils import _git_dirty
+
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    git = ["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    open(os.path.join(repo, "a.txt"), "w").write("x")
+    subprocess.run([*git, "add", "a.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+
+    assert _git_dirty(repo) is False
+    open(os.path.join(repo, "a.txt"), "w").write("edited")
+    assert _git_dirty(repo) is True
+
+
+def test_save_run_metadata_labels_peak_vram_as_process_scoped(tmp_path, monkeypatch):
+    """max_memory_allocated is a high-water mark since process start, never reset here.
+
+    A driver that trains several allocations in one process would otherwise
+    record the max over all preceding ones and make memory look invariant to k,
+    so the field has to say what it actually measures.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index=0: "stub")
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 4_000_000)
+
+    metadata = json.loads(open(save_run_metadata(str(tmp_path / "run"))).read())
+    assert metadata["peak_vram_bytes_process"] == 4_000_000
+    assert "peak_vram_bytes" not in metadata
 
 
 def test_save_run_metadata_refuses_to_let_extra_shadow_provenance(tmp_path):

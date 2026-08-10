@@ -18,7 +18,7 @@ advance in [`HYPOTHESIS.md`](HYPOTHESIS.md), before any training run.
 
 | Phase | State |
 |---|---|
-| 0 — repo, environment, constraint validator, mixed-k patcher, checkpoint I/O | ✅ complete, 96 CPU tests |
+| 0 — repo, environment, constraint validator, mixed-k patcher, checkpoint I/O | ✅ complete, 116 CPU tests |
 | 1 — constraint sweep for the target model | via `python -m adagralora.patching` |
 | 2 — data pipeline | not started |
 | 3 — checkpoint round trip | ✅ complete (`tests/test_io_roundtrip.py`) |
@@ -31,7 +31,7 @@ No training run has happened yet, so there are no results to report.
 ```bash
 pip install -r requirements.txt && pip install -e .
 python environment_check.py     # run this first on any new machine
-pytest -q                       # expect 96 passed, CPU only, no downloads
+pytest -q                       # expect 116 passed, CPU only, no downloads
 ```
 
 `environment_check.py` reports package versions, verifies that
@@ -85,6 +85,10 @@ reloaded = load_mixed_adapter(
 Every constraint is validated for the whole k-map *before* a single tensor is allocated, so an
 illegal allocation fails immediately instead of part-way through building a multi-GB model.
 
+Both calls construct their own base model, and that is not incidental: wrapping happens in
+place, so building or loading a second adapter over an already-adapted model would rewrite the
+first one's layers and hand back two handles onto the same weights. Both functions refuse it.
+
 ## Why checkpoints need a sidecar
 
 `adapter_config.json` has room for exactly one global `gralora_k`. Saving a mixed-k adapter the
@@ -116,7 +120,7 @@ src/adagralora/patching.py   constraint validation + the mixed-k builder + the s
 src/adagralora/io_utils.py   k_map.json sidecar, the custom loader, run provenance
 environment_check.py         pre-flight check for a new machine
 HYPOTHESIS.md                pre-registration: hypothesis, decision rule, negative-result policy
-tests/                       96 CPU tests; no GPU, no model download
+tests/                       116 CPU tests; no GPU, no model download
 ```
 
 ## License
